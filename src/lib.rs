@@ -24,7 +24,7 @@ use smithay_client_toolkit::{
 };
 use wayland_backend::client::{ObjectId, WaylandError};
 use wayland_client::{
-    Connection, DispatchError, EventQueue, Proxy as _, QueueHandle, delegate_dispatch,
+    Connection, DispatchError, EventQueue, Proxy as _, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
@@ -173,11 +173,17 @@ impl Context {
         // // TODO: make this function async instead of block on these?
         let egui_context = egui::Context::default();
 
+        {
+            let surface = layer.wl_surface().clone();
+            let qh = qh.clone();
+            egui_context.set_request_repaint_callback(move |_info| {
+                // TODO: handle info.delay
+                surface.frame(&qh, surface.clone());
+            });
+        }
+
         let msaa_samples = 1;
         let dithering = true;
-
-        // dbg!(wgpu_surface.
-
         let egui_render_state = pollster::block_on(egui_wgpu::RenderState::create(
             &WgpuConfiguration::default(),
             &self.delegate.wgpu_instance,
@@ -214,6 +220,8 @@ impl Context {
                 fractional_scale,
 
                 start: Instant::now(),
+                events: Vec::new(),
+                modifiers: egui::Modifiers::default(),
                 exit: false,
                 first_configure: true,
                 width: DEFAULT_WIDTH,
@@ -264,9 +272,12 @@ pub struct LayerApp {
     egui_context: egui::Context,
     egui_render_state: egui_wgpu::RenderState,
     layer: LayerSurface, // drop after wgpu_surface
+    #[allow(dead_code)] // just needs to stay alive
     fractional_scale: WpFractionalScaleV1,
 
     start: Instant,
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
     exit: bool,
     first_configure: bool,
     width: u32,
@@ -293,16 +304,11 @@ impl LayerApp {
                 egui::pos2(0., 0.),
                 egui::vec2(self.width as f32, self.height as f32),
             )),
+            events: std::mem::take(&mut self.events),
             ..Default::default()
         };
 
         self.egui_context.set_pixels_per_point(self.scale);
-
-        let surface = self.layer.wl_surface().clone();
-        let qh = qh.clone();
-        self.egui_context.set_request_repaint_callback(move |info| {
-            surface.frame(&qh, surface.clone());
-        });
 
         // let adapter = &self.egui_render_state.adapter;
         let surface = &self.wgpu_surface;
@@ -674,30 +680,39 @@ impl PointerHandler for ContextDelegate {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        use PointerEventKind::*;
-        for event in events {
-            // Ignore events for other surfaces
-            // if &event.surface != self.layer.wl_surface() {
-            //     continue;
-            // }
-            match event.kind {
-                Enter { .. } => {
-                    println!("Pointer entered @{:?}", event.position);
-                }
-                Leave { .. } => {
-                    println!("Pointer left");
-                }
-                Motion { .. } => {}
-                Press { button, .. } => {
-                    println!("Press {:x} @ {:?}", button, event.position);
-                    // self.shift = self.shift.xor(Some(0));
-                }
-                Release { button, .. } => {
-                    println!("Release {:x} @ {:?}", button, event.position);
-                }
-                Axis { horizontal, vertical, .. } => {
-                    println!("Scroll H:{horizontal:?}, V:{vertical:?}");
-                }
+        for PointerEvent { surface, position, kind } in events {
+            if let Some(app) = self.apps.get_mut(&surface.id()) {
+                let pos = egui::pos2(position.0 as f32, position.1 as f32);
+                let ev = match kind {
+                    PointerEventKind::Enter { .. } => egui::Event::PointerMoved(pos),
+                    PointerEventKind::Leave { .. } => egui::Event::PointerGone,
+                    PointerEventKind::Motion { .. } => egui::Event::PointerMoved(pos),
+                    PointerEventKind::Axis { horizontal, vertical, .. } => {
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(horizontal.absolute as f32, vertical.absolute as f32),
+                            modifiers: app.modifiers,
+                        }
+                    }
+                    PointerEventKind::Press { button, .. }
+                    | PointerEventKind::Release { button, .. } => {
+                        use smithay_client_toolkit::seat::pointer::*;
+                        egui::Event::PointerButton {
+                            pos,
+                            button: match *button {
+                                BTN_RIGHT => egui::PointerButton::Secondary,
+                                BTN_MIDDLE => egui::PointerButton::Middle,
+                                BTN_BACK | BTN_SIDE => egui::PointerButton::Extra1,
+                                BTN_FORWARD | BTN_EXTRA => egui::PointerButton::Extra2,
+                                _ => egui::PointerButton::Primary, // BTN_LEFT and unknown
+                            },
+                            pressed: matches!(kind, PointerEventKind::Press { .. }),
+                            modifiers: app.modifiers,
+                        }
+                    }
+                };
+
+                app.events.push(ev);
             }
         }
     }
