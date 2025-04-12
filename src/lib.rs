@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::ErrorKind, ptr::NonNull};
+use std::{collections::HashMap, io::ErrorKind, ptr::NonNull, time::Instant};
 
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
@@ -6,6 +6,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat,
     output::{OutputHandler, OutputState},
+    reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -23,7 +24,7 @@ use smithay_client_toolkit::{
 };
 use wayland_backend::client::{ObjectId, WaylandError};
 use wayland_client::{
-    Connection, DispatchError, EventQueue, Proxy as _, QueueHandle,
+    Connection, DispatchError, EventQueue, Proxy as _, QueueHandle, delegate_dispatch,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
 };
@@ -32,8 +33,13 @@ use wgpu::{
     rwh::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle},
 };
 
-const DEFAULT_WIDTH: u32 = 256;
-const DEFAULT_HEIGHT: u32 = 256;
+use self::{wp_fractional_scaling::FractionalScalingManager, wp_viewporter::ViewporterState};
+
+mod wp_fractional_scaling;
+mod wp_viewporter;
+
+const DEFAULT_WIDTH: u32 = 512;
+const DEFAULT_HEIGHT: u32 = 512;
 
 pub struct Context {
     event_queue: EventQueue<ContextDelegate>,
@@ -44,6 +50,8 @@ struct ContextDelegate {
     wayland_conn: Connection,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    fractional_scaling: FractionalScalingManager,
+    viewporter: ViewporterState,
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -51,6 +59,30 @@ struct ContextDelegate {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     apps: HashMap<ObjectId, LayerApp>,
+}
+
+impl ContextDelegate {
+    fn scale_factor_changed(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        new_factor: f32,
+    ) {
+        if let Some(app) = self.apps.get_mut(&surface.id()) {
+            if app.scale == new_factor {
+                // No change
+                return;
+            }
+
+            println!("Scale factor changed to {new_factor}");
+
+            app.scale = new_factor;
+            app.draw(qh);
+
+            let viewport = self.viewporter.get_viewport(app.layer.wl_surface(), qh);
+            viewport.set_destination(app.width as i32, app.height as i32);
+        }
+    }
 }
 
 impl Context {
@@ -74,12 +106,17 @@ impl Context {
 
         let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
 
+        let fractional_scaling = FractionalScalingManager::bind(&globals, &qh).unwrap();
+        let viewporter = ViewporterState::bind(&globals, &qh).unwrap();
+
         Context {
             event_queue,
             delegate: ContextDelegate {
                 wayland_conn,
                 compositor,
                 layer_shell,
+                fractional_scaling,
+                viewporter,
                 registry_state: RegistryState::new(&globals),
                 seat_state: SeatState::new(&globals, &qh),
                 output_state: OutputState::new(&globals, &qh),
@@ -106,10 +143,12 @@ impl Context {
             None,
         );
 
+        // let viewport = layer
+
         // Configure the layer surface, providing things like the anchor on screen, desired size and the keyboard
         // interactivity
         // TODO: make user-configurable
-        layer.set_anchor(Anchor::RIGHT);
+        layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
         layer.set_exclusive_zone(8);
@@ -132,18 +171,6 @@ impl Context {
         };
 
         // // TODO: make this function async instead of block on these?
-        // let wgpu_adapter = pollster::block_on(self.delegate.wgpu_instance.request_adapter(
-        //     &wgpu::RequestAdapterOptions {
-        //         compatible_surface: Some(&wgpu_surface),
-        //         ..Default::default()
-        //     },
-        // ))
-        // .expect("Failed to find an appropriate adapter");
-
-        // let (wgpu_device, wgpu_queue) =
-        //     pollster::block_on(wgpu_adapter.request_device(&Default::default(), None))
-        //         .expect("Failed to create device");
-
         let egui_context = egui::Context::default();
 
         let msaa_samples = 1;
@@ -161,14 +188,6 @@ impl Context {
         ))
         .expect("Failed to create egui render state");
 
-        // let egui_renderer = egui_wgpu::Renderer::new(
-        //     &wgpu_device,
-        //     TextureFormat::Bgra8UnormSrgb,
-        //     None,
-        //     msaa_samples,
-        //     dithering,
-        // );
-
         // In order for the layer surface to be mapped, we need to perform an initial commit with no attached\
         // buffer. For more info, see WaylandSurface::commit
         //
@@ -176,9 +195,14 @@ impl Context {
         // surface with the correct options.
         layer.commit();
 
-        self.delegate
-            .apps
-            .insert(layer.wl_surface().id(), LayerApp {
+        let fractional_scale = self
+            .delegate
+            .fractional_scaling
+            .fractional_scaling(layer.wl_surface(), &qh);
+
+        self.delegate.apps.insert(
+            layer.wl_surface().id(),
+            LayerApp {
                 app,
                 wgpu_surface,
                 // wgpu_adapter,
@@ -187,7 +211,9 @@ impl Context {
                 egui_context,
                 egui_render_state,
                 layer,
+                fractional_scale,
 
+                start: Instant::now(),
                 exit: false,
                 first_configure: true,
                 width: DEFAULT_WIDTH,
@@ -195,7 +221,8 @@ impl Context {
                 scale: 1.,
                 shift: None,
                 keyboard_focus: false,
-            });
+            },
+        );
     }
 
     pub fn poll_events(&mut self) -> Result<usize, DispatchError> {
@@ -237,7 +264,9 @@ pub struct LayerApp {
     egui_context: egui::Context,
     egui_render_state: egui_wgpu::RenderState,
     layer: LayerSurface, // drop after wgpu_surface
+    fractional_scale: WpFractionalScaleV1,
 
+    start: Instant,
     exit: bool,
     first_configure: bool,
     width: u32,
@@ -248,9 +277,32 @@ pub struct LayerApp {
 }
 
 impl LayerApp {
+    fn physical_width(&self) -> u32 {
+        (self.width as f32 * self.scale) as u32
+    }
+
+    fn physical_height(&self) -> u32 {
+        (self.height as f32 * self.scale) as u32
+    }
+
     fn draw(&mut self, qh: &QueueHandle<ContextDelegate>) {
         // TODO: input
-        let raw_input = egui::RawInput::default();
+        let raw_input = egui::RawInput {
+            time: Some(self.start.elapsed().as_secs_f64()),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0., 0.),
+                egui::vec2(self.width as f32, self.height as f32),
+            )),
+            ..Default::default()
+        };
+
+        self.egui_context.set_pixels_per_point(self.scale);
+
+        let surface = self.layer.wl_surface().clone();
+        let qh = qh.clone();
+        self.egui_context.set_request_repaint_callback(move |info| {
+            surface.frame(&qh, surface.clone());
+        });
 
         // let adapter = &self.egui_render_state.adapter;
         let surface = &self.wgpu_surface;
@@ -269,9 +321,9 @@ impl LayerApp {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: TextureFormat::Bgra8Unorm,
             view_formats: vec![TextureFormat::Bgra8Unorm],
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: self.width,
-            height: self.height,
+            alpha_mode: CompositeAlphaMode::Auto,
+            width: self.physical_width(),
+            height: self.physical_height(),
             desired_maximum_frame_latency: 2,
             // Wayland is inherently a mailbox system.
             present_mode: wgpu::PresentMode::Mailbox,
@@ -300,7 +352,7 @@ impl LayerApp {
         }
 
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.width, self.height],
+            size_in_pixels: [self.physical_height(), self.physical_height()],
             pixels_per_point: self.scale,
         };
 
@@ -349,18 +401,22 @@ impl LayerApp {
 }
 
 impl CompositorHandler for ContextDelegate {
+    // this is only for integer scaling
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
-            // this is integer scaling
-            // TODO: support fractional scaling
-            app.scale = new_factor as f32;
-            app.egui_context.set_pixels_per_point(app.scale);
+            if app.scale.round() != app.scale {
+                // app is already fractionally scaled?
+                // TODO: is this ok?
+                return;
+            }
+
+            self.scale_factor_changed(qh, surface, new_factor as f32);
         }
     }
 

@@ -39,6 +39,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut layer_app = None;
 
+    context.new_layer_app(Box::new(FprintPromptApp));
+
     loop {
         match context.poll_events() {
             Ok(0) => {}
@@ -74,6 +76,46 @@ impl egui_wlr_layer::App for FprintPromptApp {
                     std::process::exit(0);
                 }
             });
+
+            ui.spinner();
+
+            ui.label(ctx.pixels_per_point().to_string());
+
+            ui.label(ctx.debug_painter().clip_rect().to_string());
+
+            ctx.settings_ui(ui);
+
+            // let painter = ui.painter();
+            // painter.line_segment(
+            //     [ui.clip_rect().left_top(), ui.clip_rect().right_bottom()],
+            //     (1.0, egui::Color32::WHITE),
+            // );
+            // painter.line_segment(
+            //     [ui.clip_rect().left_bottom(), ui.clip_rect().right_top()],
+            //     (1.0, egui::Color32::WHITE),
+            // );
+            // painter.line_segment(
+            //     [egui::pos2(20., 20.), egui::pos2(200., 20.)],
+            //     (1.0, egui::Color32::WHITE),
+            // );
+            // painter.line_segment(
+            //     [egui::pos2(20., 30.), egui::pos2(200., 30.)],
+            //     (2.0, egui::Color32::WHITE),
+            // );
+            // painter.line_segment(
+            //     [
+            //         egui::pos2(20., 60. / ctx.pixels_per_point()),
+            //         egui::pos2(200., 60. / ctx.pixels_per_point()),
+            //     ],
+            //     (1. / ctx.pixels_per_point(), egui::Color32::WHITE),
+            // );
+            // painter.line_segment(
+            //     [
+            //         egui::pos2(20., 80. / ctx.pixels_per_point()),
+            //         egui::pos2(200., 80. / ctx.pixels_per_point()),
+            //     ],
+            //     (2. / ctx.pixels_per_point(), egui::Color32::WHITE),
+            // );
         });
     }
 }
