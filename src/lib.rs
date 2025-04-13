@@ -1,4 +1,13 @@
-use std::{collections::HashMap, io::ErrorKind, ptr::NonNull, time::Instant};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 
 use egui::AreaState;
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
@@ -41,6 +50,7 @@ use wgpu::{
 
 use self::{wp_fractional_scaling::FractionalScalingManager, wp_viewporter::ViewporterState};
 
+mod keysyms;
 mod wp_fractional_scaling;
 mod wp_viewporter;
 
@@ -87,6 +97,39 @@ impl ContextDelegate {
 
             app.scale = new_factor;
             app.draw(&self.compositor);
+        }
+    }
+
+    fn key_event(&mut self, event: KeyEvent, pressed: bool) {
+        let _p = Profiler::new("Key press");
+
+        if let Some(app) = self.apps.values_mut().find(|app| app.keyboard_focus) {
+            if let Some(c) = event.utf8 {
+                if !c.is_empty() && c.chars().all(|c| !c.is_control()) {
+                    println!("Key press: {c:?}");
+                    app.events.push(egui::Event::Text(c));
+                }
+            }
+
+            let Some(key) = keysyms::wl_to_egui(event.keysym) else {
+                println!(
+                    "Unknown keysym: name: {:?}, char: {:?}",
+                    event.keysym.name(),
+                    event.keysym.key_char(),
+                );
+                return;
+            };
+
+            app.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: app.modifiers,
+            });
+            app.egui_context.request_repaint();
+        } else {
+            println!("No app with keyboard focus");
         }
     }
 }
@@ -229,12 +272,21 @@ impl Context {
         // // TODO: make this function async instead of block on these?
         let egui_context = egui::Context::default();
 
+        let frame_requested = Arc::new(AtomicBool::new(true));
+
         {
             let surface = layer.wl_surface().clone();
             let qh = qh.clone();
+            let frame_requested = frame_requested.clone();
             egui_context.set_request_repaint_callback(move |_info| {
                 // TODO: handle info.delay
-                surface.frame(&qh, surface.clone());
+                if !frame_requested.load(Ordering::Relaxed) {
+                    println!("redraw requested at {:?}", Instant::now());
+                    surface.frame(&qh, surface.clone());
+                    frame_requested.store(true, Ordering::Relaxed);
+                } else {
+                    println!("dropped");
+                }
             });
         }
 
@@ -275,6 +327,7 @@ impl Context {
                 layer,
                 fractional_scale,
 
+                frame_requested,
                 start: Instant::now(),
                 events: Vec::new(),
                 modifiers: egui::Modifiers::default(),
@@ -339,6 +392,7 @@ pub struct LayerApp {
     #[allow(dead_code)] // just needs to stay alive
     fractional_scale: WpFractionalScaleV1,
 
+    frame_requested: Arc<AtomicBool>,
     start: Instant,
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
@@ -362,6 +416,11 @@ impl LayerApp {
     }
 
     fn draw(&mut self, compositor: &CompositorState) {
+        self.frame_requested.store(false, Ordering::Relaxed);
+        let _p = Profiler::new("Draw");
+
+        println!("Drawing app");
+
         // TODO: input
         let raw_input = egui::RawInput {
             time: Some(self.start.elapsed().as_secs_f64()),
@@ -370,6 +429,7 @@ impl LayerApp {
                 egui::vec2(self.width as f32, self.height as f32),
             )),
             events: std::mem::take(&mut self.events),
+            modifiers: self.modifiers,
             ..Default::default()
         };
 
@@ -547,7 +607,6 @@ impl CompositorHandler for ContextDelegate {
         _surface: &wl_surface::WlSurface,
         _new_transform: wl_output::Transform,
     ) {
-        // TODO
     }
 
     fn frame(
@@ -569,7 +628,6 @@ impl CompositorHandler for ContextDelegate {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // TODO
     }
 
     fn surface_leave(
@@ -579,7 +637,6 @@ impl CompositorHandler for ContextDelegate {
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
-        // TODO
     }
 }
 
@@ -594,7 +651,6 @@ impl OutputHandler for ContextDelegate {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        // TODO
     }
 
     fn update_output(
@@ -603,7 +659,6 @@ impl OutputHandler for ContextDelegate {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        // TODO
     }
 
     fn output_destroyed(
@@ -612,7 +667,6 @@ impl OutputHandler for ContextDelegate {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
-        // TODO
     }
 }
 
@@ -729,8 +783,6 @@ impl KeyboardHandler for ContextDelegate {
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
             app.keyboard_focus = true;
-            // app.modifiers = Modifiers::from_keysyms(keysyms);
-            // app.draw(&self.event_queue.handle());
         }
     }
 
@@ -739,13 +791,12 @@ impl KeyboardHandler for ContextDelegate {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _serial: u32,
     ) {
-        // if self.layer.wl_surface() == surface {
-        //     println!("Release keyboard focus on window");
-        //     self.keyboard_focus = false;
-        // }
+        if let Some(app) = self.apps.get_mut(&surface.id()) {
+            app.keyboard_focus = false;
+        }
     }
 
     fn press_key(
@@ -756,11 +807,7 @@ impl KeyboardHandler for ContextDelegate {
         _serial: u32,
         event: KeyEvent,
     ) {
-        println!("Key press: {event:?}");
-        // press 'esc' to exit
-        if event.keysym == Keysym::Escape {
-            // self.exit = true;
-        }
+        self.key_event(event, true);
     }
 
     fn release_key(
@@ -771,7 +818,7 @@ impl KeyboardHandler for ContextDelegate {
         _serial: u32,
         event: KeyEvent,
     ) {
-        println!("Key release: {event:?}");
+        self.key_event(event, false);
     }
 
     fn update_modifiers(
@@ -783,7 +830,15 @@ impl KeyboardHandler for ContextDelegate {
         modifiers: Modifiers,
         _layout: u32,
     ) {
-        println!("Update modifiers: {modifiers:?}");
+        if let Some(app) = self.apps.values_mut().find(|app| app.keyboard_focus) {
+            app.modifiers = egui::Modifiers {
+                alt: modifiers.alt,
+                ctrl: modifiers.ctrl,
+                shift: modifiers.shift,
+                mac_cmd: false,
+                command: modifiers.ctrl,
+            };
+        }
     }
 }
 
@@ -856,4 +911,21 @@ impl ProvidesRegistryState for ContextDelegate {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+struct Profiler {
+    name: &'static str,
+    start: Instant,
+}
+
+impl Profiler {
+    fn new(name: &'static str) -> Self {
+        Self { name, start: Instant::now() }
+    }
+}
+
+impl Drop for Profiler {
+    fn drop(&mut self) {
+        println!("Profiler {}: {:?}", self.name, self.start.elapsed());
+    }
 }
