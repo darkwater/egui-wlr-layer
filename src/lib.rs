@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::ErrorKind, ptr::NonNull, time::Instant};
 
+use egui::ahash::{HashSet, HashSetExt as _};
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -38,8 +39,8 @@ use self::{wp_fractional_scaling::FractionalScalingManager, wp_viewporter::Viewp
 mod wp_fractional_scaling;
 mod wp_viewporter;
 
-const DEFAULT_WIDTH: u32 = 512;
-const DEFAULT_HEIGHT: u32 = 512;
+const DEFAULT_WIDTH: u32 = 1920;
+const DEFAULT_HEIGHT: u32 = 1080;
 
 pub struct Context {
     event_queue: EventQueue<ContextDelegate>,
@@ -76,11 +77,11 @@ impl ContextDelegate {
 
             println!("Scale factor changed to {new_factor}");
 
-            app.scale = new_factor;
-            app.draw(qh);
-
             let viewport = self.viewporter.get_viewport(app.layer.wl_surface(), qh);
             viewport.set_destination(app.width as i32, app.height as i32);
+
+            app.scale = new_factor;
+            app.draw(qh);
         }
     }
 }
@@ -128,7 +129,7 @@ impl Context {
         }
     }
 
-    pub fn new_layer_app(&mut self, app: Box<dyn App + Send>) {
+    pub fn new_layer_app(&mut self, app: Box<dyn App>) {
         let qh = self.event_queue.handle();
 
         // A layer surface is created from a surface.
@@ -327,7 +328,7 @@ impl LayerApp {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: TextureFormat::Bgra8Unorm,
             view_formats: vec![TextureFormat::Bgra8Unorm],
-            alpha_mode: CompositeAlphaMode::Auto,
+            alpha_mode: CompositeAlphaMode::PreMultiplied,
             width: self.physical_width(),
             height: self.physical_height(),
             desired_maximum_frame_latency: 2,
@@ -358,7 +359,7 @@ impl LayerApp {
         }
 
         let screen_descriptor = ScreenDescriptor {
-            size_in_pixels: [self.physical_height(), self.physical_height()],
+            size_in_pixels: [self.physical_width(), self.physical_height()],
             pixels_per_point: self.scale,
         };
 
@@ -378,7 +379,7 @@ impl LayerApp {
                         view: &texture_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -605,27 +606,28 @@ impl SeatHandler for ContextDelegate {
 impl KeyboardHandler for ContextDelegate {
     fn enter(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
+        _serial: u32,
+        _raw: &[u32],
         keysyms: &[Keysym],
     ) {
-        // if self.layer.wl_surface() == surface {
-        //     println!("Keyboard focus on window with pressed syms: {keysyms:?}");
-        //     self.keyboard_focus = true;
-        // }
+        if let Some(app) = self.apps.get_mut(&surface.id()) {
+            app.keyboard_focus = true;
+            // app.modifiers = Modifiers::from_keysyms(keysyms);
+            // app.draw(&self.event_queue.handle());
+        }
     }
 
     fn leave(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        surface: &wl_surface::WlSurface,
-        _: u32,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
     ) {
         // if self.layer.wl_surface() == surface {
         //     println!("Release keyboard focus on window");
@@ -637,8 +639,8 @@ impl KeyboardHandler for ContextDelegate {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
         event: KeyEvent,
     ) {
         println!("Key press: {event:?}");
@@ -650,10 +652,10 @@ impl KeyboardHandler for ContextDelegate {
 
     fn release_key(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
         event: KeyEvent,
     ) {
         println!("Key release: {event:?}");
@@ -661,9 +663,9 @@ impl KeyboardHandler for ContextDelegate {
 
     fn update_modifiers(
         &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
         modifiers: Modifiers,
         _layout: u32,
@@ -676,12 +678,14 @@ impl PointerHandler for ContextDelegate {
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for PointerEvent { surface, position, kind } in events {
             if let Some(app) = self.apps.get_mut(&surface.id()) {
+                app.egui_context.request_repaint();
+
                 let pos = egui::pos2(position.0 as f32, position.1 as f32);
                 let ev = match kind {
                     PointerEventKind::Enter { .. } => egui::Event::PointerMoved(pos),
@@ -689,8 +693,11 @@ impl PointerHandler for ContextDelegate {
                     PointerEventKind::Motion { .. } => egui::Event::PointerMoved(pos),
                     PointerEventKind::Axis { horizontal, vertical, .. } => {
                         egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: egui::vec2(horizontal.absolute as f32, vertical.absolute as f32),
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: egui::vec2(
+                                horizontal.discrete as f32,
+                                -vertical.discrete as f32,
+                            ),
                             modifiers: app.modifiers,
                         }
                     }
@@ -713,6 +720,8 @@ impl PointerHandler for ContextDelegate {
                 };
 
                 app.events.push(ev);
+
+                app.egui_context.request_repaint();
             }
         }
     }
