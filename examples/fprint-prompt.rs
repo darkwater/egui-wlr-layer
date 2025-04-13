@@ -95,11 +95,17 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // let mut layer_app = None;
 
-    context.new_layer_app(Box::new(FprintPromptApp), LayerAppOpts {
-        layer: Layer::Overlay,
-        namespace: Some("fprint-prompt"),
-        output: Some(&|info: egui_wlr_layer::OutputInfo| info.name == Some("eDP-1".to_string())),
-    });
+    context.new_layer_app(
+        Box::new(FprintPromptApp),
+        LayerAppOpts {
+            layer: Layer::Overlay,
+            namespace: Some("fprint-prompt"),
+            output: Some(&|info: egui_wlr_layer::OutputInfo| {
+                info.name == Some("eDP-1".to_string())
+            }),
+            ..Default::default()
+        },
+    );
 
     loop {
         match context.poll_dispatch() {

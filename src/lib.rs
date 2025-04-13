@@ -1,8 +1,9 @@
 use std::{collections::HashMap, io::ErrorKind, ptr::NonNull, time::Instant};
 
+use egui::AreaState;
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
     delegate_registry, delegate_seat,
     output::{OutputHandler, OutputState},
@@ -85,15 +86,43 @@ impl ContextDelegate {
             viewport.set_destination(app.width as i32, app.height as i32);
 
             app.scale = new_factor;
-            app.draw(qh);
+            app.draw(&self.compositor);
         }
     }
+}
+
+/// Whether/how to use input regions, can be used to let mouse and touch inputs fall through the
+/// layer surface.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum InputRegions {
+    /// The entire surface takes mouse inputs.
+    #[default]
+    Full,
+    /// The background layer doesn't take inputs, only windows and popups do. This means that eg.
+    /// CentralPanels and SidePanels will not take inputs, because they're typically drawn on the
+    /// background layer.
+    WindowsOnly,
+    /// The layer surface doesn't take any mouse or touch inputs at all.
+    None,
+    // TODO: add more options (select layers, custom behaviour)
 }
 
 pub struct LayerAppOpts<'a> {
     pub layer: Layer,
     pub namespace: Option<&'a str>,
     pub output: Option<&'a dyn Fn(OutputInfo) -> bool>,
+    pub input_regions: InputRegions,
+}
+
+impl Default for LayerAppOpts<'_> {
+    fn default() -> Self {
+        Self {
+            layer: Layer::Top,
+            namespace: Default::default(),
+            output: Default::default(),
+            input_regions: InputRegions::Full,
+        }
+    }
 }
 
 // pub type OutputSelector = Box<dyn Fn(OutputInfo) -> bool>;
@@ -144,7 +173,12 @@ impl Context {
     pub fn new_layer_app(
         &mut self,
         mut app: Box<dyn App>,
-        LayerAppOpts { layer, namespace, output }: LayerAppOpts,
+        LayerAppOpts {
+            layer,
+            namespace,
+            output,
+            input_regions,
+        }: LayerAppOpts,
     ) {
         let qh = self.event_queue.handle();
 
@@ -228,9 +262,9 @@ impl Context {
             .fractional_scaling
             .fractional_scaling(layer.wl_surface(), &qh);
 
-        self.delegate
-            .apps
-            .insert(layer.wl_surface().id(), LayerApp {
+        self.delegate.apps.insert(
+            layer.wl_surface().id(),
+            LayerApp {
                 app,
                 wgpu_surface,
                 // wgpu_adapter,
@@ -244,6 +278,7 @@ impl Context {
                 start: Instant::now(),
                 events: Vec::new(),
                 modifiers: egui::Modifiers::default(),
+                input_regions,
                 exit: false,
                 first_configure: true,
                 width: DEFAULT_WIDTH,
@@ -251,7 +286,8 @@ impl Context {
                 scale: 1.,
                 shift: None,
                 keyboard_focus: false,
-            });
+            },
+        );
     }
 
     pub fn poll_dispatch(&mut self) -> Result<usize, DispatchError> {
@@ -306,6 +342,7 @@ pub struct LayerApp {
     start: Instant,
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
+    input_regions: InputRegions,
     exit: bool,
     first_configure: bool,
     width: u32,
@@ -324,7 +361,7 @@ impl LayerApp {
         (self.height as f32 * self.scale) as u32
     }
 
-    fn draw(&mut self, qh: &QueueHandle<ContextDelegate>) {
+    fn draw(&mut self, compositor: &CompositorState) {
         // TODO: input
         let raw_input = egui::RawInput {
             time: Some(self.start.elapsed().as_secs_f64()),
@@ -427,6 +464,55 @@ impl LayerApp {
             self.egui_render_state.renderer.write().free_texture(x)
         }
 
+        match self.input_regions {
+            InputRegions::Full => self.layer.set_input_region(None),
+            InputRegions::WindowsOnly => {
+                if let Ok(region) = Region::new(compositor) {
+                    let layers = self
+                        .egui_context
+                        .memory(|memory| {
+                            let areas = memory.areas();
+
+                            areas
+                                .visible_layer_ids()
+                                .into_iter()
+                                .filter(|layer| layer.order > egui::Order::Background)
+                                .filter(|layer| areas.is_visible(layer))
+                                .map(|layer| layer.id)
+                                .collect::<Vec<_>>()
+                        })
+                        .into_iter()
+                        .filter_map(|id| AreaState::load(&self.egui_context, id));
+
+                    for layer in layers {
+                        if let (Some(pos), Some(size)) = (layer.pivot_pos, layer.size) {
+                            region.add(
+                                pos.x.floor() as i32,
+                                pos.y.floor() as i32,
+                                size.x.ceil() as i32,
+                                size.y.ceil() as i32,
+                            );
+                        }
+                    }
+
+                    self.layer.set_input_region(Some(region.wl_region()));
+                }
+            }
+            InputRegions::None => {
+                if let Ok(region) = Region::new(compositor) {
+                    region.add(0, 0, 0, 0);
+                    self.layer.set_input_region(Some(region.wl_region()));
+                }
+            }
+        }
+
+        // if self.egui_context.wants_pointer_input() {
+        //     self.layer.set_input_region(None);
+        // } else if let Ok(region) = Region::new(compositor) {
+        //     region.add(0, 0, 0, 0);
+        //     self.layer.set_input_region(Some(region.wl_region()));
+        // }
+
         // Submit the command in the queue to execute
         queue.submit(Some(encoder.finish()));
 
@@ -467,12 +553,12 @@ impl CompositorHandler for ContextDelegate {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
-            app.draw(qh);
+            app.draw(&self.compositor);
         }
     }
 
@@ -538,7 +624,7 @@ impl LayerShellHandler for ContextDelegate {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -570,7 +656,7 @@ impl LayerShellHandler for ContextDelegate {
             // Initiate the first draw.
             if app.first_configure {
                 app.first_configure = false;
-                app.draw(qh);
+                app.draw(&self.compositor);
             }
         }
     }
@@ -639,7 +725,7 @@ impl KeyboardHandler for ContextDelegate {
         surface: &wl_surface::WlSurface,
         _serial: u32,
         _raw: &[u32],
-        keysyms: &[Keysym],
+        _keysyms: &[Keysym],
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
             app.keyboard_focus = true;
@@ -705,7 +791,7 @@ impl PointerHandler for ContextDelegate {
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
