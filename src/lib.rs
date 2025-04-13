@@ -1,6 +1,5 @@
 use std::{collections::HashMap, io::ErrorKind, ptr::NonNull, time::Instant};
 
-use egui::ahash::{HashSet, HashSetExt as _};
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -17,17 +16,22 @@ use smithay_client_toolkit::{
     },
     shell::{
         WaylandSurface,
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
+        wlr_layer::{LayerShell, LayerShellHandler, LayerSurfaceConfigure},
     },
+};
+pub use smithay_client_toolkit::{
+    output::OutputInfo,
+    shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerSurface},
 };
 use wayland_backend::client::{ObjectId, WaylandError};
 use wayland_client::{
     Connection, DispatchError, EventQueue, Proxy as _, QueueHandle,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
+    protocol::{
+        wl_keyboard,
+        wl_output::{self},
+        wl_pointer, wl_seat, wl_surface,
+    },
 };
 use wgpu::{
     CompositeAlphaMode,
@@ -86,6 +90,14 @@ impl ContextDelegate {
     }
 }
 
+pub struct LayerAppOpts<'a> {
+    pub layer: Layer,
+    pub namespace: Option<&'a str>,
+    pub output: Option<&'a dyn Fn(OutputInfo) -> bool>,
+}
+
+// pub type OutputSelector = Box<dyn Fn(OutputInfo) -> bool>;
+
 impl Context {
     pub fn new() -> Self {
         // All Wayland apps start by connecting the compositor (server).
@@ -129,30 +141,39 @@ impl Context {
         }
     }
 
-    pub fn new_layer_app(&mut self, app: Box<dyn App>) {
+    pub fn new_layer_app(
+        &mut self,
+        mut app: Box<dyn App>,
+        LayerAppOpts { layer, namespace, output }: LayerAppOpts,
+    ) {
         let qh = self.event_queue.handle();
 
         // A layer surface is created from a surface.
         let wl_surface = self.delegate.compositor.create_surface(&qh);
 
+        let output = output.and_then(|selector| {
+            self.delegate
+                .output_state
+                .outputs()
+                .filter_map(|output| {
+                    self.delegate
+                        .output_state
+                        .info(&output)
+                        .map(|info| (info, output))
+                })
+                .find_map(|(info, output)| selector(info).then_some(output))
+        });
+
         // And then we create the layer shell.
         let layer = self.delegate.layer_shell.create_layer_surface(
             &qh,
             wl_surface,
-            Layer::Top,
-            Some("simple_layer"),
-            None,
+            layer,
+            namespace,
+            output.as_ref(),
         );
 
-        // let viewport = layer
-
-        // Configure the layer surface, providing things like the anchor on screen, desired size and the keyboard
-        // interactivity
-        // TODO: make user-configurable
-        layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(DEFAULT_WIDTH, DEFAULT_HEIGHT);
-        layer.set_exclusive_zone(8);
+        app.on_init(&layer);
 
         let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
             NonNull::new(self.delegate.wayland_conn.backend().display_ptr() as *mut _).unwrap(),
@@ -207,9 +228,9 @@ impl Context {
             .fractional_scaling
             .fractional_scaling(layer.wl_surface(), &qh);
 
-        self.delegate.apps.insert(
-            layer.wl_surface().id(),
-            LayerApp {
+        self.delegate
+            .apps
+            .insert(layer.wl_surface().id(), LayerApp {
                 app,
                 wgpu_surface,
                 // wgpu_adapter,
@@ -230,11 +251,10 @@ impl Context {
                 scale: 1.,
                 shift: None,
                 keyboard_focus: false,
-            },
-        );
+            });
     }
 
-    pub fn poll_events(&mut self) -> Result<usize, DispatchError> {
+    pub fn poll_dispatch(&mut self) -> Result<usize, DispatchError> {
         let dispatched = self.event_queue.dispatch_pending(&mut self.delegate)?;
         if dispatched > 0 {
             return Ok(dispatched);
@@ -252,6 +272,10 @@ impl Context {
             Ok(0)
         }
     }
+
+    pub fn blocking_dispatch(&mut self) -> Result<usize, DispatchError> {
+        self.event_queue.blocking_dispatch(&mut self.delegate)
+    }
 }
 
 impl Default for Context {
@@ -260,8 +284,11 @@ impl Default for Context {
     }
 }
 
+#[allow(unused_variables)]
 pub trait App {
     fn update(&mut self, ctx: &egui::Context);
+
+    fn on_init(&mut self, layer: &LayerSurface) {}
 }
 
 pub struct LayerApp {

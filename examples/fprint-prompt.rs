@@ -1,8 +1,64 @@
 use std::{
     io::{BufRead as _, BufReader},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+use egui::{Color32, FontId, LayerId, Rect, pos2, text::LayoutJob};
+use egui_wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerAppOpts, LayerSurface};
+
+struct PositionInfo {
+    thickness: u32,
+    length: u32,
+    edge: Anchor,
+    close_to: Anchor,
+    offset: u32,
+}
+
+const POS: PositionInfo = PositionInfo {
+    thickness: 3,
+    length: 86,
+    // TODO: actually support other orientations
+    edge: Anchor::RIGHT,
+    close_to: Anchor::TOP,
+    offset: 63,
+};
+
+const AREA_LENGTH: u32 = 180;
+
+impl PositionInfo {
+    const fn win_width(&self) -> u32 {
+        match self.edge {
+            Anchor::TOP | Anchor::BOTTOM => self.length + self.offset,
+            Anchor::LEFT | Anchor::RIGHT => self.thickness + AREA_LENGTH,
+            _ => unreachable!(),
+        }
+    }
+
+    const fn win_height(&self) -> u32 {
+        match self.edge {
+            Anchor::TOP | Anchor::BOTTOM => self.thickness,
+            Anchor::LEFT | Anchor::RIGHT => self.length + self.offset,
+            _ => unreachable!(),
+        }
+    }
+
+    const fn area_width(&self) -> u32 {
+        match self.edge {
+            Anchor::TOP | Anchor::BOTTOM => self.length,
+            Anchor::LEFT | Anchor::RIGHT => AREA_LENGTH,
+            _ => unreachable!(),
+        }
+    }
+
+    const fn area_height(&self) -> u32 {
+        match self.edge {
+            Anchor::TOP | Anchor::BOTTOM => AREA_LENGTH,
+            Anchor::LEFT | Anchor::RIGHT => self.length,
+            _ => unreachable!(),
+        }
+    }
+}
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor for fprint events
@@ -39,13 +95,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // let mut layer_app = None;
 
-    context.new_layer_app(Box::new(FprintPromptApp {
-        demo: Default::default(),
-        last_frame: Instant::now(),
-    }));
+    context.new_layer_app(Box::new(FprintPromptApp), LayerAppOpts {
+        layer: Layer::Overlay,
+        namespace: Some("fprint-prompt"),
+        output: Some(&|info: egui_wlr_layer::OutputInfo| info.name == Some("eDP-1".to_string())),
+    });
 
     loop {
-        match context.poll_events() {
+        match context.poll_dispatch() {
             Ok(0) => {}
             Ok(n) => {
                 println!("handled {} events", n);
@@ -68,92 +125,77 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-struct FprintPromptApp {
-    demo: egui_demo_lib::DemoWindows,
-    last_frame: Instant,
-}
+struct FprintPromptApp;
 
 impl egui_wlr_layer::App for FprintPromptApp {
     fn update(&mut self, ctx: &egui::Context) {
-        self.demo.ui(ctx);
+        ctx.style_mut(|s| {
+            s.visuals.panel_fill = Color32::TRANSPARENT;
+            s.visuals.widgets.noninteractive.fg_stroke = (1., Color32::WHITE).into();
+        });
 
-        let painter = ctx.debug_painter();
-        painter.line_segment(
-            [ctx.screen_rect().left_top(), ctx.screen_rect().right_bottom()],
-            (1.0, egui::Color32::WHITE),
+        let time = ctx.input(|i| i.time) as f32;
+        let wiggle = text_animation(time);
+
+        let painter = ctx.layer_painter(LayerId::background());
+        let job = painter.layout_job(LayoutJob::simple(
+            "Touch to verify".to_string(),
+            FontId::proportional(20.),
+            Color32::WHITE,
+            AREA_LENGTH as f32,
+        ));
+
+        painter.galley(
+            pos2(
+                POS.area_width() as f32 / 2. - wiggle,
+                POS.offset as f32 + POS.area_height() as f32 / 2.,
+            ) - job.size() / 2.,
+            job,
+            // Align2::CENTER_CENTER,
+            Color32::WHITE,
         );
-        painter.line_segment(
-            [ctx.screen_rect().left_bottom(), ctx.screen_rect().right_top()],
-            (1.0, egui::Color32::WHITE),
-        );
-        painter.text(
-            egui::pos2(0., 100.),
-            egui::Align2::LEFT_TOP,
-            painter.clip_rect(),
-            egui::FontId::proportional(12.),
-            egui::Color32::WHITE,
-        );
-        painter.text(
-            egui::pos2(0., 120.),
-            egui::Align2::LEFT_TOP,
-            format!("Frame time: {:?}", self.last_frame.elapsed()),
-            egui::FontId::proportional(12.),
-            egui::Color32::WHITE,
+
+        let thickness = POS.thickness as f32 * (time * 5.).min(1.0);
+
+        painter.rect_filled(
+            Rect::from_two_pos(
+                pos2(POS.win_width() as f32, POS.offset as f32),
+                pos2(POS.win_width() as f32 - thickness, POS.win_height() as f32),
+            ),
+            0.,
+            Color32::WHITE,
         );
 
-        // egui::CentralPanel::default().show(ctx, |ui| {
-        //     ui.label("Please touch the fingerprint reader");
-        //     ui.horizontal(|ui| {
-        //         if ui.button("Cancel").clicked() {
-        //             std::process::exit(0);
-        //         }
-        //     });
-
-        //     ui.collapsing("Spinner", |ui| {
-        //         ui.spinner();
-        //     });
-
-        //     ui.label(ctx.pixels_per_point().to_string());
-
-        //     ui.label(ctx.debug_painter().clip_rect().to_string());
-
-        //     egui::ScrollArea::new([false, true]).show(ui, |ui| {
-        //         ctx.settings_ui(ui);
-        //     });
-
-        //     // let painter = ui.painter();
-        //     // painter.line_segment(
-        //     //     [ui.clip_rect().left_top(), ui.clip_rect().right_bottom()],
-        //     //     (1.0, egui::Color32::WHITE),
-        //     // );
-        //     // painter.line_segment(
-        //     //     [ui.clip_rect().left_bottom(), ui.clip_rect().right_top()],
-        //     //     (1.0, egui::Color32::WHITE),
-        //     // );
-        //     // painter.line_segment(
-        //     //     [egui::pos2(20., 20.), egui::pos2(200., 20.)],
-        //     //     (1.0, egui::Color32::WHITE),
-        //     // );
-        //     // painter.line_segment(
-        //     //     [egui::pos2(20., 30.), egui::pos2(200., 30.)],
-        //     //     (2.0, egui::Color32::WHITE),
-        //     // );
-        //     // painter.line_segment(
-        //     //     [
-        //     //         egui::pos2(20., 60. / ctx.pixels_per_point()),
-        //     //         egui::pos2(200., 60. / ctx.pixels_per_point()),
-        //     //     ],
-        //     //     (1. / ctx.pixels_per_point(), egui::Color32::WHITE),
-        //     // );
-        //     // painter.line_segment(
-        //     //     [
-        //     //         egui::pos2(20., 80. / ctx.pixels_per_point()),
-        //     //         egui::pos2(200., 80. / ctx.pixels_per_point()),
-        //     //     ],
-        //     //     (2. / ctx.pixels_per_point(), egui::Color32::WHITE),
-        //     // );
-        // });
-
-        self.last_frame = Instant::now();
+        ctx.request_repaint();
     }
+
+    fn on_init(&mut self, layer: &LayerSurface) {
+        layer.set_anchor(POS.edge | POS.close_to);
+        layer.set_size(POS.win_width(), POS.win_height());
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    }
+}
+
+fn text_animation(time: f32) -> f32 {
+    // Configurable parameters
+    let speed = 2.0; // Slows down the animation; lower = slower
+    let magnitude = 10.; // The maximum distance from the center
+    let start_scale = 20.0; // The multiplier at time = 0
+
+    // Scaled time
+    let t = time * speed;
+
+    // Phase within one sine wave cycle
+    let x = t;
+    let sin_x = x.sin();
+
+    // Linearly interpolate scale from `start_scale` to 1.0 over [0, PI/2]
+    let scale = if x < std::f32::consts::FRAC_PI_2 {
+        start_scale - (start_scale - 1.0) * (x / std::f32::consts::FRAC_PI_2)
+    } else {
+        1.0
+    };
+
+    // Apply transformation and re-center around 0
+    ((sin_x - 1.0) * scale + 1.0) * magnitude
 }
