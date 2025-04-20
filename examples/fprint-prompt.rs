@@ -95,17 +95,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut context = egui_wlr_layer::Context::new();
 
-    // let mut layer_app = None;
-
-    context.new_layer_app(
-        Box::new(FprintPromptApp),
-        LayerAppOpts {
-            layer: Layer::Overlay,
-            namespace: Some("fprint-prompt"),
-            output: Some(&|info: OutputInfo| dbg!(info.name) == Some("eDP-1".to_string())),
-            input_regions: InputRegions::None,
-        },
-    );
+    let mut layer_app = None;
 
     loop {
         match context.poll_dispatch() {
@@ -122,10 +112,22 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(waiting) = rx.recv_timeout(Duration::from_millis(1)) {
             if waiting {
                 // fprint is waiting for a finger touch
-                // layer_app = Some(context.new_layer_app(Box::new(FprintPromptApp)));
+                layer_app = Some(context.new_layer_app(
+                    Box::new(FprintPromptApp),
+                    LayerAppOpts {
+                        layer: Layer::Overlay,
+                        namespace: Some("fprint-prompt"),
+                        output: Some(&|info: OutputInfo| {
+                            dbg!(info.name) == Some("eDP-1".to_string())
+                        }),
+                        input_regions: InputRegions::None,
+                    },
+                ));
             } else {
                 // fprint is no longer waiting for a finger touch
-                // layer_app.take();
+                if let Some(handle) = layer_app.take() {
+                    handle.exit();
+                }
             }
         }
     }

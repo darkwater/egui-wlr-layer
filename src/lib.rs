@@ -231,7 +231,7 @@ impl Context {
             output,
             input_regions,
         }: LayerAppOpts,
-    ) {
+    ) -> LayerAppHandle {
         let qh = self.event_queue.handle();
 
         // A layer surface is created from a surface.
@@ -332,15 +332,14 @@ impl Context {
             .fractional_scaling
             .fractional_scaling(layer.wl_surface(), &qh);
 
+        let exit = Arc::new(AtomicBool::new(false));
+
         self.delegate.apps.insert(
             layer.wl_surface().id(),
             LayerApp {
                 app,
                 wgpu_surface,
-                // wgpu_adapter,
-                // wgpu_device,
-                // wgpu_queue,
-                egui_context,
+                egui_context: egui_context.clone(),
                 egui_render_state,
                 layer,
                 fractional_scale,
@@ -350,7 +349,7 @@ impl Context {
                 events: Vec::new(),
                 modifiers: egui::Modifiers::default(),
                 input_regions,
-                exit: false,
+                exit: exit.clone(),
                 first_configure: true,
                 width: DEFAULT_WIDTH,
                 height: DEFAULT_HEIGHT,
@@ -359,6 +358,8 @@ impl Context {
                 keyboard_focus: false,
             },
         );
+
+        LayerAppHandle { egui_context, exit }
     }
 
     pub fn poll_dispatch(&mut self) -> Result<usize, DispatchError> {
@@ -396,6 +397,7 @@ pub trait App {
     fn update(&mut self, ctx: &egui::Context);
 
     fn on_init(&mut self, layer: &LayerSurface) {}
+    fn on_exit(&mut self) {}
 }
 
 pub struct LayerApp {
@@ -415,13 +417,25 @@ pub struct LayerApp {
     events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
     input_regions: InputRegions,
-    exit: bool,
+    exit: Arc<AtomicBool>,
     first_configure: bool,
     width: u32,
     height: u32,
     scale: f32,
     shift: Option<u32>,
     keyboard_focus: bool,
+}
+
+pub struct LayerAppHandle {
+    egui_context: egui::Context,
+    exit: Arc<AtomicBool>,
+}
+
+impl LayerAppHandle {
+    pub fn exit(&self) {
+        self.exit.store(true, Ordering::Relaxed);
+        self.egui_context.request_repaint();
+    }
 }
 
 impl LayerApp {
@@ -631,8 +645,20 @@ impl CompositorHandler for ContextDelegate {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        let mut exit = None;
+
         if let Some(app) = self.apps.get_mut(&surface.id()) {
-            app.draw(&self.compositor);
+            if app.exit.load(Ordering::Relaxed) {
+                exit = Some(surface.id());
+            } else {
+                app.draw(&self.compositor);
+            }
+        }
+
+        if let Some(id) = exit {
+            if let Some(mut app) = self.apps.remove(&id) {
+                app.app.on_exit();
+            }
         }
     }
 
