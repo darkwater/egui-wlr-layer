@@ -5,7 +5,9 @@ use std::{
 };
 
 use egui::{Color32, FontId, LayerId, Rect, pos2, text::LayoutJob};
-use egui_wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerAppOpts, LayerSurface};
+use egui_wlr_layer::{
+    Anchor, InputRegions, KeyboardInteractivity, Layer, LayerAppOpts, LayerSurface, OutputInfo,
+};
 
 struct PositionInfo {
     thickness: u32,
@@ -100,10 +102,8 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         LayerAppOpts {
             layer: Layer::Overlay,
             namespace: Some("fprint-prompt"),
-            output: Some(&|info: egui_wlr_layer::OutputInfo| {
-                info.name == Some("eDP-1".to_string())
-            }),
-            ..Default::default()
+            output: Some(&|info: OutputInfo| dbg!(info.name) == Some("eDP-1".to_string())),
+            input_regions: InputRegions::None,
         },
     );
 
@@ -144,12 +144,15 @@ impl egui_wlr_layer::App for FprintPromptApp {
         let wiggle = text_animation(time);
 
         let painter = ctx.layer_painter(LayerId::background());
-        let job = painter.layout_job(LayoutJob::simple(
-            "Touch to verify".to_string(),
-            FontId::proportional(20.),
-            Color32::WHITE,
-            AREA_LENGTH as f32,
-        ));
+        let job = painter.layout_job(LayoutJob {
+            round_output_to_gui: false,
+            ..LayoutJob::simple(
+                "Touch to verify".to_string(),
+                FontId::proportional(20.),
+                Color32::WHITE,
+                AREA_LENGTH as f32,
+            )
+        });
 
         painter.galley(
             pos2(

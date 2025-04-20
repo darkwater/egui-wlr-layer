@@ -4,7 +4,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = egui_wlr_layer::Context::new();
 
     context.new_layer_app(
-        Box::new(DemoApp(Default::default())),
+        Box::new(DemoApp::default()),
         LayerAppOpts {
             layer: Layer::Top,
             namespace: Some("egui-demo"),
@@ -18,11 +18,14 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-struct DemoApp(egui_demo_lib::DemoWindows);
+#[derive(Default)]
+struct DemoApp {
+    demo: egui_demo_lib::DemoWindows,
+}
 
 impl egui_wlr_layer::App for DemoApp {
     fn update(&mut self, ctx: &egui::Context) {
-        self.0.ui(ctx);
+        self.demo.ui(ctx);
     }
 
     fn on_init(&mut self, layer: &smithay_client_toolkit::shell::wlr_layer::LayerSurface) {

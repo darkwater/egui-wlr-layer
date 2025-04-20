@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::ErrorKind,
+    mem::take,
     ptr::NonNull,
     sync::{
         Arc,
@@ -9,12 +10,12 @@ use std::{
     time::Instant,
 };
 
-use egui::AreaState;
+use egui::{AreaState, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat,
+    delegate_registry, delegate_seat, delegate_touch,
     output::{OutputHandler, OutputState},
     reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
     registry::{ProvidesRegistryState, RegistryState},
@@ -23,6 +24,7 @@ use smithay_client_toolkit::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        touch::TouchHandler,
     },
     shell::{
         WaylandSurface,
@@ -40,7 +42,7 @@ use wayland_client::{
     protocol::{
         wl_keyboard,
         wl_output::{self},
-        wl_pointer, wl_seat, wl_surface,
+        wl_pointer, wl_seat, wl_surface, wl_touch,
     },
 };
 use wgpu::{
@@ -74,7 +76,14 @@ struct ContextDelegate {
     wgpu_instance: wgpu::Instance,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    touches: HashMap<i32, TouchState>,
     apps: HashMap<ObjectId, LayerApp>,
+}
+
+struct TouchState {
+    surface_id: ObjectId,
+    last_position: Pos2,
 }
 
 impl ContextDelegate {
@@ -101,8 +110,6 @@ impl ContextDelegate {
     }
 
     fn key_event(&mut self, event: KeyEvent, pressed: bool) {
-        let _p = Profiler::new("Key press");
-
         if let Some(app) = self.apps.values_mut().find(|app| app.keyboard_focus) {
             if let Some(c) = event.utf8 {
                 if !c.is_empty() && c.chars().all(|c| !c.is_control()) {
@@ -208,6 +215,8 @@ impl Context {
                 wgpu_instance,
                 keyboard: None,
                 pointer: None,
+                touch: None,
+                touches: HashMap::new(),
                 apps: HashMap::new(),
             },
         }
@@ -247,10 +256,20 @@ impl Context {
             wl_surface,
             layer,
             namespace,
-            output.as_ref(),
+            dbg!(output.as_ref()),
         );
 
         app.on_init(&layer);
+
+        match input_regions {
+            InputRegions::Full => layer.set_input_region(None),
+            InputRegions::WindowsOnly | InputRegions::None => {
+                if let Ok(region) = Region::new(&self.delegate.compositor) {
+                    region.add(0, 0, 0, 0);
+                    layer.set_input_region(Some(region.wl_region()));
+                }
+            }
+        }
 
         let raw_display_handle = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
             NonNull::new(self.delegate.wayland_conn.backend().display_ptr() as *mut _).unwrap(),
@@ -281,7 +300,6 @@ impl Context {
             egui_context.set_request_repaint_callback(move |_info| {
                 // TODO: handle info.delay
                 if !frame_requested.load(Ordering::Relaxed) {
-                    println!("redraw requested at {:?}", Instant::now());
                     surface.frame(&qh, surface.clone());
                     frame_requested.store(true, Ordering::Relaxed);
                 } else {
@@ -417,9 +435,6 @@ impl LayerApp {
 
     fn draw(&mut self, compositor: &CompositorState) {
         self.frame_requested.store(false, Ordering::Relaxed);
-        let _p = Profiler::new("Draw");
-
-        println!("Drawing app");
 
         // TODO: input
         let raw_input = egui::RawInput {
@@ -428,7 +443,7 @@ impl LayerApp {
                 egui::pos2(0., 0.),
                 egui::vec2(self.width as f32, self.height as f32),
             )),
-            events: std::mem::take(&mut self.events),
+            events: dbg!(take(&mut self.events)),
             modifiers: self.modifiers,
             ..Default::default()
         };
@@ -651,6 +666,7 @@ impl OutputHandler for ContextDelegate {
         _qh: &QueueHandle<Self>,
         _output: wl_output::WlOutput,
     ) {
+        println!("new output");
     }
 
     fn update_output(
@@ -747,6 +763,15 @@ impl SeatHandler for ContextDelegate {
                 .expect("Failed to create pointer");
             self.pointer = Some(pointer);
         }
+
+        if capability == Capability::Touch && self.touch.is_none() {
+            println!("Set touch capability");
+            let touch = self
+                .seat_state
+                .get_touch(qh, &seat)
+                .expect("Failed to create touch");
+            self.touch = Some(touch);
+        }
     }
 
     fn remove_capability(
@@ -764,6 +789,11 @@ impl SeatHandler for ContextDelegate {
         if capability == Capability::Pointer && self.pointer.is_some() {
             println!("Unset pointer capability");
             self.pointer.take().unwrap().release();
+        }
+
+        if capability == Capability::Touch && self.touch.is_some() {
+            println!("Unset touch capability");
+            self.touch.take().unwrap().release();
         }
     }
 
@@ -783,6 +813,7 @@ impl KeyboardHandler for ContextDelegate {
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
             app.keyboard_focus = true;
+            app.events.push(egui::Event::WindowFocused(true));
         }
     }
 
@@ -796,6 +827,7 @@ impl KeyboardHandler for ContextDelegate {
     ) {
         if let Some(app) = self.apps.get_mut(&surface.id()) {
             app.keyboard_focus = false;
+            app.events.push(egui::Event::WindowFocused(false));
         }
     }
 
@@ -851,12 +883,11 @@ impl PointerHandler for ContextDelegate {
         events: &[PointerEvent],
     ) {
         for PointerEvent { surface, position, kind } in events {
+            println!("Pointer event: {kind:?} {position:?}");
             if let Some(app) = self.apps.get_mut(&surface.id()) {
-                app.egui_context.request_repaint();
-
                 let pos = egui::pos2(position.0 as f32, position.1 as f32);
                 let ev = match kind {
-                    PointerEventKind::Enter { .. } => egui::Event::PointerMoved(pos),
+                    PointerEventKind::Enter { .. } => continue, // egui::Event::PointerMoved(pos),
                     PointerEventKind::Leave { .. } => egui::Event::PointerGone,
                     PointerEventKind::Motion { .. } => egui::Event::PointerMoved(pos),
                     PointerEventKind::Axis { horizontal, vertical, .. } => {
@@ -875,11 +906,11 @@ impl PointerHandler for ContextDelegate {
                         egui::Event::PointerButton {
                             pos,
                             button: match *button {
-                                BTN_RIGHT => egui::PointerButton::Secondary,
-                                BTN_MIDDLE => egui::PointerButton::Middle,
-                                BTN_BACK | BTN_SIDE => egui::PointerButton::Extra1,
-                                BTN_FORWARD | BTN_EXTRA => egui::PointerButton::Extra2,
-                                _ => egui::PointerButton::Primary, // BTN_LEFT and unknown
+                                BTN_RIGHT => PointerButton::Secondary,
+                                BTN_MIDDLE => PointerButton::Middle,
+                                BTN_BACK | BTN_SIDE => PointerButton::Extra1,
+                                BTN_FORWARD | BTN_EXTRA => PointerButton::Extra2,
+                                _ => PointerButton::Primary, // BTN_LEFT and unknown
                             },
                             pressed: matches!(kind, PointerEventKind::Press { .. }),
                             modifiers: app.modifiers,
@@ -888,7 +919,163 @@ impl PointerHandler for ContextDelegate {
                 };
 
                 app.events.push(ev);
+                app.egui_context.request_repaint();
+            }
+        }
+    }
+}
 
+impl TouchHandler for ContextDelegate {
+    fn down(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        surface: wl_surface::WlSurface,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if let Some(app) = self.apps.get_mut(&surface.id()) {
+            let pos = egui::pos2(position.0 as f32, position.1 as f32);
+
+            app.events.extend_from_slice(&[
+                egui::Event::PointerGone,
+                egui::Event::Touch {
+                    device_id: TouchDeviceId(0),
+                    id: TouchId(id as u64),
+                    phase: TouchPhase::Start,
+                    pos,
+                    force: None,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: app.modifiers,
+                },
+            ]);
+
+            self.touches.insert(
+                id,
+                TouchState {
+                    surface_id: surface.id(),
+                    last_position: pos,
+                },
+            );
+
+            app.egui_context.request_repaint();
+        }
+    }
+
+    fn up(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _serial: u32,
+        _time: u32,
+        id: i32,
+    ) {
+        if let Some(touch_state) = self.touches.get(&id) {
+            if let Some(app) = self.apps.get_mut(&touch_state.surface_id) {
+                app.events.extend_from_slice(&[
+                    egui::Event::Touch {
+                        device_id: TouchDeviceId(0),
+                        id: TouchId(id as u64),
+                        phase: TouchPhase::End,
+                        pos: touch_state.last_position,
+                        force: None,
+                    },
+                    egui::Event::PointerButton {
+                        pos: touch_state.last_position,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: app.modifiers,
+                    },
+                    egui::Event::PointerGone,
+                ]);
+
+                app.egui_context.request_repaint();
+            }
+        }
+    }
+
+    fn motion(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _time: u32,
+        id: i32,
+        position: (f64, f64),
+    ) {
+        if let Some(touch_state) = self.touches.get_mut(&id) {
+            if let Some(app) = self.apps.get_mut(&touch_state.surface_id) {
+                let pos = egui::pos2(position.0 as f32, position.1 as f32);
+                app.events.extend_from_slice(&[
+                    egui::Event::Touch {
+                        device_id: TouchDeviceId(0),
+                        id: TouchId(id as u64),
+                        phase: TouchPhase::Move,
+                        pos,
+                        force: None,
+                    },
+                    egui::Event::PointerMoved(pos),
+                ]);
+
+                touch_state.last_position = pos;
+
+                app.egui_context.request_repaint();
+            }
+        }
+    }
+
+    fn shape(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _id: i32,
+        _major: f64,
+        _minor: f64,
+    ) {
+        // unused
+    }
+
+    fn orientation(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _touch: &wl_touch::WlTouch,
+        _id: i32,
+        _orientation: f64,
+    ) {
+        // unused
+    }
+
+    fn cancel(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _touch: &wl_touch::WlTouch) {
+        #[allow(clippy::mutable_key_type)]
+        let mut emit_pointer_gone = HashSet::new();
+
+        for (id, touch_state) in take(&mut self.touches) {
+            if let Some(app) = self.apps.get_mut(&touch_state.surface_id) {
+                app.events.push(egui::Event::Touch {
+                    device_id: TouchDeviceId(0),
+                    id: TouchId(id as u64),
+                    phase: TouchPhase::Cancel,
+                    pos: touch_state.last_position,
+                    force: None,
+                });
+
+                emit_pointer_gone.insert(touch_state.surface_id);
+            }
+        }
+
+        for surface_id in emit_pointer_gone {
+            if let Some(app) = self.apps.get_mut(&surface_id) {
+                app.events.push(egui::Event::PointerGone);
                 app.egui_context.request_repaint();
             }
         }
@@ -900,6 +1087,7 @@ delegate_output!(ContextDelegate);
 
 delegate_seat!(ContextDelegate);
 delegate_keyboard!(ContextDelegate);
+delegate_touch!(ContextDelegate);
 delegate_pointer!(ContextDelegate);
 
 delegate_layer!(ContextDelegate);
