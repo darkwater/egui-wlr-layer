@@ -10,7 +10,9 @@ use std::{
     time::Instant,
 };
 
-use egui::{AreaState, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
+use egui::{
+    AreaState, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase, ViewportId, ViewportInfo,
+};
 use egui_wgpu::{ScreenDescriptor, WgpuConfiguration, wgpu::TextureFormat};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
@@ -449,19 +451,30 @@ impl LayerApp {
     fn draw(&mut self, compositor: &CompositorState) {
         self.frame_requested.store(false, Ordering::Relaxed);
 
+        let zoom = self.egui_context.zoom_factor();
+        let scale = self.scale * zoom;
+
+        let viewports = std::iter::once((
+            ViewportId::ROOT,
+            ViewportInfo {
+                native_pixels_per_point: Some(self.scale),
+                ..Default::default()
+            },
+        ))
+        .collect();
+
         // TODO: input
         let raw_input = egui::RawInput {
             time: Some(self.start.elapsed().as_secs_f64()),
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0., 0.),
-                egui::vec2(self.width as f32, self.height as f32),
+                egui::vec2(self.width as f32 / zoom, self.height as f32 / zoom),
             )),
             events: take(&mut self.events),
             modifiers: self.modifiers,
+            viewports,
             ..Default::default()
         };
-
-        self.egui_context.set_pixels_per_point(self.scale);
 
         // let adapter = &self.egui_render_state.adapter;
         let surface = &self.wgpu_surface;
@@ -472,9 +485,7 @@ impl LayerApp {
 
         // TODO: handle full_output.platform_output
 
-        let paint_jobs = self
-            .egui_context
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let paint_jobs = self.egui_context.tessellate(full_output.shapes, scale);
 
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -512,7 +523,7 @@ impl LayerApp {
 
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [self.physical_width(), self.physical_height()],
-            pixels_per_point: self.scale,
+            pixels_per_point: scale,
         };
 
         self.egui_render_state.renderer.write().update_buffers(
