@@ -113,7 +113,6 @@ impl ContextDelegate {
         if let Some(app) = self.apps.values_mut().find(|app| app.keyboard_focus) {
             if let Some(c) = event.utf8 {
                 if !c.is_empty() && c.chars().all(|c| !c.is_control()) {
-                    println!("Key press: {c:?}");
                     app.events.push(egui::Event::Text(c));
                 }
             }
@@ -256,7 +255,7 @@ impl Context {
             wl_surface,
             layer,
             namespace,
-            dbg!(output.as_ref()),
+            output.as_ref(),
         );
 
         app.on_init(&layer);
@@ -457,7 +456,7 @@ impl LayerApp {
                 egui::pos2(0., 0.),
                 egui::vec2(self.width as f32, self.height as f32),
             )),
-            events: dbg!(take(&mut self.events)),
+            events: take(&mut self.events),
             modifiers: self.modifiers,
             ..Default::default()
         };
@@ -909,7 +908,6 @@ impl PointerHandler for ContextDelegate {
         events: &[PointerEvent],
     ) {
         for PointerEvent { surface, position, kind } in events {
-            println!("Pointer event: {kind:?} {position:?}");
             if let Some(app) = self.apps.get_mut(&surface.id()) {
                 let pos = egui::pos2(position.0 as f32, position.1 as f32);
                 let ev = match kind {
