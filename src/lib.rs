@@ -67,6 +67,8 @@ pub struct Context {
 }
 
 struct ContextDelegate {
+    apps: HashMap<ObjectId, LayerApp>,
+    wgpu_instance: wgpu::Instance,
     wayland_conn: Connection,
     compositor: CompositorState,
     layer_shell: LayerShell,
@@ -75,12 +77,10 @@ struct ContextDelegate {
     registry_state: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
-    wgpu_instance: wgpu::Instance,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     touch: Option<wl_touch::WlTouch>,
     touches: HashMap<i32, TouchState>,
-    apps: HashMap<ObjectId, LayerApp>,
 }
 
 struct TouchState {
@@ -409,9 +409,9 @@ pub struct LayerApp {
     // wgpu_queue: wgpu::Queue,
     egui_context: egui::Context,
     egui_render_state: egui_wgpu::RenderState,
-    layer: LayerSurface, // drop after wgpu_surface
     #[allow(dead_code)] // just needs to stay alive
     fractional_scale: WpFractionalScaleV1,
+    layer: LayerSurface, // drop after wgpu_surface
 
     frame_requested: Arc<AtomicBool>,
     start: Instant,
@@ -616,6 +616,8 @@ impl LayerApp {
         queue.submit(Some(encoder.finish()));
 
         surface_texture.present();
+
+        self.layer.commit();
     }
 }
 
